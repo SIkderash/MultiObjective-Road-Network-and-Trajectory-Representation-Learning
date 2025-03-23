@@ -146,30 +146,126 @@ class MaskedWeekday(nn.Module):
         labels = kwargs['origin_weekday'].reshape(-1)
         logits = self.linear(self.dropout(x)).reshape(-1, 7)
         return self.loss_func(logits, labels)
+    
+
+class ContrastiveHead(nn.Module):
+    def __init__(self, embed_dim, temperature=0.1):
+        super().__init__()
+        self.temperature = temperature
+        self.projection = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.ReLU(),
+            nn.Linear(embed_dim, embed_dim)
+        )
+        self.loss_func = nn.CrossEntropyLoss()
+
+    def forward(self, embeds):
+        """
+        embeds: [2B, D] — first B are anchors, second B are positives
+        """
+        z = F.normalize(self.projection(embeds), dim=1)  # [2B, D]
+        sim_matrix = torch.matmul(z, z.T) / self.temperature  # [2B, 2B]
+
+        labels = torch.arange(0, z.size(0) // 2).repeat(2).to(embeds.device)
+        labels[::2] += 1
+        labels[1::2] -= 1
+
+        mask = ~torch.eye(z.size(0), dtype=torch.bool, device=embeds.device)
+        sim_matrix = sim_matrix.masked_select(mask).view(z.size(0), -1)
+
+        return self.loss_func(sim_matrix, labels)
 
 
 
-# ==== Full Model ====
+
+# # ==== Full Model ====
+# class TrajectoryModel(nn.Module):
+#     def __init__(self, config, graph_data):
+#         super().__init__()
+#         self.gat = GATModel(config['node_feat_dim'], config['gat_hidden'], config['embed_dim'])
+#         self.cnn = CNNModel(config['spatial_in_channels'], config['embed_dim'])
+#         # self.temporal_encoding = TemporalEncoding(embed_dim=config['embed_dim'])
+
+#         self.spatial_transformer = SpatialTransformer(config['embed_dim'], config['num_heads'], config['spatial_layers'])
+#         self.traj_transformer = TrajectoryTransformer(config['embed_dim'], config['num_heads'], config['traj_layers'])
+
+#         # Learnable mask token
+#         self.mask_token = nn.Parameter(torch.zeros(1, config['embed_dim']))
+
+#         # Heads
+#         self.mtm = MTMHead(config['embed_dim'], config['num_nodes'])
+#         self.mtd = MTDHead(config['embed_dim'])
+#         self.hour_head = MaskedHour(config['embed_dim'])
+#         self.weekday_head = MaskedWeekday(config['embed_dim'])
+
+#         # Save graph data for reuse
+#         self._x, self._edge_index = graph_data
+
+#     def encode_graph(self):
+#         self.eval()
+#         with torch.no_grad():
+#             device = next(self.parameters()).device
+#             x = self._x.to(device)
+#             edge_index = self._edge_index.to(device)
+#             node_embeddings = self.gat(x, edge_index)
+#             return node_embeddings
+
+#     def forward(self, batch, spatial_grid):
+#         device = next(self.parameters()).device
+#         B, L = batch['road_nodes'].shape
+
+#         # === GAT ===
+#         x = self._x.to(device)
+#         edge_index = self._edge_index.to(device)
+#         node_embeddings = self.gat(x, edge_index)  # [N, D]
+
+#         node_embeddings = torch.cat([node_embeddings, self.mask_token.to(device)], dim=0)
+#         road_embeddings = node_embeddings[batch['road_nodes']]  # [B, L, D]
+
+#         # === Spatial Transformer ===
+#         spatial_features = self.cnn(spatial_grid.to(device))  # [1, D, H, W]
+#         spatial_tokens = spatial_features.flatten(2).transpose(1, 2)  # [1, S, D]
+#         spatial_repr = self.spatial_transformer(spatial_tokens).expand(B, -1, -1)  # [B, S, D]
+
+#         # === Trajectory Transformer ===
+#         fused_repr = self.traj_transformer(road_embeddings, spatial_repr, spatial_repr)  # [B, L, D]
+
+#         # === Heads ===
+#         mtm_x = fused_repr[batch['mtm_mask']]
+#         mtd_x = fused_repr[batch['mtd_mask']]
+#         hour_x = fused_repr[batch['mtm_mask']]
+#         weekday_x = fused_repr[batch['mtm_mask']]
+
+#         # Losses
+#         L_mtm = self.mtm(mtm_x, origin_nodes=batch['mtm_labels'])
+#         L_mtd = self.mtd(mtd_x, origin_deltas=batch['mtd_labels'])
+#         L_hour = self.hour_head(hour_x, origin_hour=batch['hour_labels'])
+#         L_weekday = self.weekday_head(weekday_x, origin_weekday=batch['weekday_labels'])
+
+#         return L_mtm, L_mtd, L_hour, L_weekday
+
+
+#         # === Add Temporal Encoding ===
+#         # timestamps = batch['timestamps'][:, :-1].float()  # shape [B, L]
+#         # time_repr = self.temporal_encoding(timestamps)    # shape [B, L, D]
+#         # road_embeddings += time_repr  # Add temporal context
+
+
+
+
 class TrajectoryModel(nn.Module):
     def __init__(self, config, graph_data):
         super().__init__()
         self.gat = GATModel(config['node_feat_dim'], config['gat_hidden'], config['embed_dim'])
         self.cnn = CNNModel(config['spatial_in_channels'], config['embed_dim'])
-        # self.temporal_encoding = TemporalEncoding(embed_dim=config['embed_dim'])
-
         self.spatial_transformer = SpatialTransformer(config['embed_dim'], config['num_heads'], config['spatial_layers'])
         self.traj_transformer = TrajectoryTransformer(config['embed_dim'], config['num_heads'], config['traj_layers'])
 
-        # Learnable mask token
         self.mask_token = nn.Parameter(torch.zeros(1, config['embed_dim']))
-
-        # Heads
         self.mtm = MTMHead(config['embed_dim'], config['num_nodes'])
-        self.mtd = MTDHead(config['embed_dim'])
-        self.hour_head = MaskedHour(config['embed_dim'])
-        self.weekday_head = MaskedWeekday(config['embed_dim'])
-
-        # Save graph data for reuse
+        self.contrastive_head = ContrastiveHead(config['embed_dim'])
+        self.contrastive_weight = config.get('λ_contrastive', 1.0)
+        
         self._x, self._edge_index = graph_data
 
     def encode_graph(self):
@@ -185,38 +281,30 @@ class TrajectoryModel(nn.Module):
         device = next(self.parameters()).device
         B, L = batch['road_nodes'].shape
 
-        # === GAT ===
         x = self._x.to(device)
         edge_index = self._edge_index.to(device)
-        node_embeddings = self.gat(x, edge_index)  # [N, D]
-
+        node_embeddings = self.gat(x, edge_index)
         node_embeddings = torch.cat([node_embeddings, self.mask_token.to(device)], dim=0)
-        road_embeddings = node_embeddings[batch['road_nodes']]  # [B, L, D]
 
-        # === Spatial Transformer ===
-        spatial_features = self.cnn(spatial_grid.to(device))  # [1, D, H, W]
-        spatial_tokens = spatial_features.flatten(2).transpose(1, 2)  # [1, S, D]
-        spatial_repr = self.spatial_transformer(spatial_tokens).expand(B, -1, -1)  # [B, S, D]
+        road_embeddings = node_embeddings[batch['road_nodes']]
 
-        # === Trajectory Transformer ===
-        fused_repr = self.traj_transformer(road_embeddings, spatial_repr, spatial_repr)  # [B, L, D]
+        spatial_features = self.cnn(spatial_grid.to(device))
+        spatial_tokens = spatial_features.flatten(2).transpose(1, 2)
+        spatial_repr = self.spatial_transformer(spatial_tokens).expand(B, -1, -1)
 
-        # === Heads ===
+        fused_repr = self.traj_transformer(road_embeddings, spatial_repr, spatial_repr)
+
         mtm_x = fused_repr[batch['mtm_mask']]
-        mtd_x = fused_repr[batch['mtd_mask']]
-        hour_x = fused_repr[batch['mtm_mask']]
-        weekday_x = fused_repr[batch['mtm_mask']]
-
-        # Losses
         L_mtm = self.mtm(mtm_x, origin_nodes=batch['mtm_labels'])
-        L_mtd = self.mtd(mtd_x, origin_deltas=batch['mtd_labels'])
-        L_hour = self.hour_head(hour_x, origin_hour=batch['hour_labels'])
-        L_weekday = self.weekday_head(weekday_x, origin_weekday=batch['weekday_labels'])
 
-        return L_mtm, L_mtd, L_hour, L_weekday
+        # === Contrastive Loss (Optional) ===
+        L_contrastive = None
+        if batch.get('contrastive', False):
+            traj_embed = fused_repr.mean(dim=1)  # [B, D]
+            L_contrastive = self.contrastive_head(traj_embed)
 
+        if L_contrastive is not None:
+            return L_mtm + self.contrastive_weight * L_contrastive, L_mtm, L_contrastive
+        else:
+            return L_mtm, L_mtm, None
 
-        # === Add Temporal Encoding ===
-        # timestamps = batch['timestamps'][:, :-1].float()  # shape [B, L]
-        # time_repr = self.temporal_encoding(timestamps)    # shape [B, L, D]
-        # road_embeddings += time_repr  # Add temporal context

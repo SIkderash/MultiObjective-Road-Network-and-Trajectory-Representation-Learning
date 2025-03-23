@@ -111,7 +111,7 @@ if __name__ == "__main__":
     }
 
     model = TrajectoryModel(config, graph_data)
-    checkpoint = torch.load("checkpoints/model_epoch_10.pt")
+    checkpoint = torch.load("checkpoints/model_epoch_5.pt")
     model.load_state_dict(checkpoint['model_state_dict'])
     model = model.cuda().eval()
 
