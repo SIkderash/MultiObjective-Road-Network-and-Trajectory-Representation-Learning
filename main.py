@@ -165,7 +165,7 @@ if __name__ == "__main__":
     model = TrajectoryModel(config, graph_data).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-    for epoch in range(1, 11):
+    for epoch in range(1, 5):
         avg_loss = train(model, train_loader, graph_data, spatial_grid_tensor, optimizer, config, device, epoch)
         val_metrics = validate(model, val_loader, graph_data, spatial_grid_tensor, config, device)
 

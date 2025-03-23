@@ -263,8 +263,6 @@ class TrajectoryModel(nn.Module):
 
         self.mask_token = nn.Parameter(torch.zeros(1, config['embed_dim']))
         self.mtm = MTMHead(config['embed_dim'], config['num_nodes'])
-        self.contrastive_head = ContrastiveHead(config['embed_dim'])
-        self.contrastive_weight = config.get('λ_contrastive', 1.0)
         
         self._x, self._edge_index = graph_data
 
