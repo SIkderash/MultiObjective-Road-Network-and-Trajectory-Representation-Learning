@@ -297,14 +297,5 @@ class TrajectoryModel(nn.Module):
         mtm_x = fused_repr[batch['mtm_mask']]
         L_mtm = self.mtm(mtm_x, origin_nodes=batch['mtm_labels'])
 
-        # === Contrastive Loss (Optional) ===
-        L_contrastive = None
-        if batch.get('contrastive', False):
-            traj_embed = fused_repr.mean(dim=1)  # [B, D]
-            L_contrastive = self.contrastive_head(traj_embed)
-
-        if L_contrastive is not None:
-            return L_mtm + self.contrastive_weight * L_contrastive, L_mtm, L_contrastive
-        else:
-            return L_mtm, L_mtm, None
+        return L_mtm
 
