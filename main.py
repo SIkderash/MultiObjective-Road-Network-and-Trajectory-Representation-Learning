@@ -24,8 +24,8 @@ def train(model, dataloader, graph_data, spatial_grid, optimizer, config, device
     for batch_idx, batch in enumerate(pbar):
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
-        L_mtm = model(batch, spatial_grid)
-        loss = config['λ1'] * L_mtm
+        L_mtm, L_contrastive = model(batch, spatial_grid)
+        loss = config['λ1'] * L_mtm + config['λ2'] * L_contrastive
 
         optimizer.zero_grad()
         loss.backward()
@@ -36,16 +36,20 @@ def train(model, dataloader, graph_data, spatial_grid, optimizer, config, device
         pbar.set_postfix({
             "Batch Loss": f"{loss.item():.4f}",
             "MTM": f"{L_mtm.item():.4f}",
+            "CL": f"{L_contrastive.item():.4f}",
             "Avg Loss": f"{total_loss / (batch_idx + 1):.4f}"
         })
 
     return total_loss / num_batches
+
+
 
 @torch.no_grad()
 def validate(model, dataloader, graph_data, spatial_grid, config, device):
     model.eval()
     total_loss = 0
     total_mtm = 0
+    total_cl = 0
     num_batches = len(dataloader)
 
     x, edge_index = graph_data
@@ -54,16 +58,19 @@ def validate(model, dataloader, graph_data, spatial_grid, config, device):
 
     for batch in dataloader:
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-        L_mtm = model(batch, spatial_grid)
-        loss = config['λ1'] * L_mtm
+        L_mtm, L_contrastive = model(batch, spatial_grid)
 
+        loss = config['λ1'] * L_mtm + config['λ2'] * L_contrastive
         total_loss += loss.item()
         total_mtm += L_mtm.item()
+        total_cl += L_contrastive.item()
 
     return {
         'val_loss': total_loss / num_batches,
         'val_mtm': total_mtm / num_batches,
+        'val_cl': total_cl / num_batches,
     }
+
 
 def optimized_load_trajectory_data(data_path, include_files=None):
     all_files = sorted([
@@ -76,6 +83,9 @@ def optimized_load_trajectory_data(data_path, include_files=None):
         all_files = [os.path.join(data_path, f) for f in include_files]
 
     dfs = []
+
+
+    use_one_file = True
     for file_path in all_files:
         print("Loading file: ", file_path)
         df = pd.read_csv(file_path, converters={
@@ -84,6 +94,8 @@ def optimized_load_trajectory_data(data_path, include_files=None):
             'pass_time': ast.literal_eval
         })
         dfs.append(df)
+        if use_one_file:
+            break
 
     df = pd.concat(dfs, ignore_index=True)
 
@@ -147,6 +159,7 @@ if __name__ == "__main__":
     spatial_grid_tensor = torch.tensor(spatial_grid_np, dtype=torch.float32).unsqueeze(0)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # device = torch.device("cpu")
     graph_data = (node_features, torch.tensor(edge_index, dtype=torch.long))
     spatial_grid_tensor = spatial_grid_tensor.to(device)
 
@@ -159,7 +172,8 @@ if __name__ == "__main__":
         'spatial_layers': 2,
         'traj_layers': 2,
         'num_nodes': node_features.shape[0],
-        'λ1': 1.0
+        'λ1': 1.0,
+        'λ2': 5.0
     }
 
     model = TrajectoryModel(config, graph_data).to(device)
@@ -169,7 +183,7 @@ if __name__ == "__main__":
         avg_loss = train(model, train_loader, graph_data, spatial_grid_tensor, optimizer, config, device, epoch)
         val_metrics = validate(model, val_loader, graph_data, spatial_grid_tensor, config, device)
 
-        print(f"[Epoch {epoch}] | Train Loss: {avg_loss:.4f} | Val Loss: {val_metrics['val_loss']:.4f} | MTM: {val_metrics['val_mtm']:.4f}")
+        print(f"[Epoch {epoch}] | Train Loss: {avg_loss:.4f} | Val Loss: {val_metrics['val_loss']:.4f} | MTM: {val_metrics['val_mtm']:.4f} | CL: {val_metrics['val_cl']:.4f}")
 
         save_path = os.path.join("checkpoints", f"model_epoch_{epoch}.pt")
         os.makedirs("checkpoints", exist_ok=True)

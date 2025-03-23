@@ -1,4 +1,5 @@
 import math
+import random
 import numpy as np
 import torch
 import torch.nn as nn
@@ -161,19 +162,23 @@ class ContrastiveHead(nn.Module):
 
     def forward(self, embeds):
         """
-        embeds: [2B, D] — first B are anchors, second B are positives
+        embeds: [2B, D] where first B are anchors, second B are positives
         """
         z = F.normalize(self.projection(embeds), dim=1)  # [2B, D]
-        sim_matrix = torch.matmul(z, z.T) / self.temperature  # [2B, 2B]
+        B = z.size(0) // 2
 
-        labels = torch.arange(0, z.size(0) // 2).repeat(2).to(embeds.device)
-        labels[::2] += 1
-        labels[1::2] -= 1
+        # Similarity matrix (excluding self)
+        sim = torch.matmul(z, z.T) / self.temperature  # [2B, 2B]
+        mask = torch.eye(2 * B, device=embeds.device, dtype=torch.bool)
+        sim.masked_fill_(mask, -1e9)
 
-        mask = ~torch.eye(z.size(0), dtype=torch.bool, device=embeds.device)
-        sim_matrix = sim_matrix.masked_select(mask).view(z.size(0), -1)
+        # Construct targets
+        targets = torch.arange(B, 2 * B, device=embeds.device)
+        targets = torch.cat([targets, torch.arange(0, B, device=embeds.device)], dim=0)
 
-        return self.loss_func(sim_matrix, labels)
+        return self.loss_func(sim, targets)
+
+
 
 
 
@@ -263,17 +268,14 @@ class TrajectoryModel(nn.Module):
 
         self.mask_token = nn.Parameter(torch.zeros(1, config['embed_dim']))
         self.mtm = MTMHead(config['embed_dim'], config['num_nodes'])
+<<<<<<< Updated upstream
         
         self._x, self._edge_index = graph_data
+=======
+        self.contrastive_head = ContrastiveHead(config['embed_dim'])
+>>>>>>> Stashed changes
 
-    def encode_graph(self):
-        self.eval()
-        with torch.no_grad():
-            device = next(self.parameters()).device
-            x = self._x.to(device)
-            edge_index = self._edge_index.to(device)
-            node_embeddings = self.gat(x, edge_index)
-            return node_embeddings
+        self._x, self._edge_index = graph_data
 
     def forward(self, batch, spatial_grid):
         device = next(self.parameters()).device
@@ -284,16 +286,36 @@ class TrajectoryModel(nn.Module):
         node_embeddings = self.gat(x, edge_index)
         node_embeddings = torch.cat([node_embeddings, self.mask_token.to(device)], dim=0)
 
+        # === View 1 ===
         road_embeddings = node_embeddings[batch['road_nodes']]
-
         spatial_features = self.cnn(spatial_grid.to(device))
         spatial_tokens = spatial_features.flatten(2).transpose(1, 2)
         spatial_repr = self.spatial_transformer(spatial_tokens).expand(B, -1, -1)
-
         fused_repr = self.traj_transformer(road_embeddings, spatial_repr, spatial_repr)
 
         mtm_x = fused_repr[batch['mtm_mask']]
         L_mtm = self.mtm(mtm_x, origin_nodes=batch['mtm_labels'])
 
+<<<<<<< Updated upstream
         return L_mtm
+=======
+        # === View 2 (Augmented for contrastive) ===
+        road_nodes_pos = batch['road_nodes'].clone()
+        mtm_mask_pos = torch.zeros_like(road_nodes_pos, dtype=torch.bool)
+        for i in range(B):
+            num_mask = max(1, int(0.15 * L))
+            mask_indices = random.sample(range(L), num_mask)
+            mtm_mask_pos[i, mask_indices] = 1
+        road_nodes_pos[mtm_mask_pos] = self._x.shape[0]  # [MASK] token index
+
+        road_embed_pos = node_embeddings[road_nodes_pos]
+        fused_pos = self.traj_transformer(road_embed_pos, spatial_repr, spatial_repr)
+
+        traj_embed = fused_repr.mean(dim=1)        # [B, D]
+        traj_embed_pos = fused_pos.mean(dim=1)     # [B, D]
+        concat_embed = torch.cat([traj_embed, traj_embed_pos], dim=0)  # [2B, D]
+        L_contrastive = self.contrastive_head(concat_embed)
+
+        return L_mtm, L_contrastive
+>>>>>>> Stashed changes
 
