@@ -1,5 +1,6 @@
 import math
 import random
+import random
 import numpy as np
 import torch
 import torch.nn as nn
@@ -163,6 +164,7 @@ class ContrastiveHead(nn.Module):
     def forward(self, embeds):
         """
         embeds: [2B, D] where first B are anchors, second B are positives
+        embeds: [2B, D] where first B are anchors, second B are positives
         """
         z = F.normalize(self.projection(embeds), dim=1)  # [2B, D]
         B = z.size(0) // 2
@@ -175,6 +177,19 @@ class ContrastiveHead(nn.Module):
         # Construct targets
         targets = torch.arange(B, 2 * B, device=embeds.device)
         targets = torch.cat([targets, torch.arange(0, B, device=embeds.device)], dim=0)
+        B = z.size(0) // 2
+
+        # Similarity matrix (excluding self)
+        sim = torch.matmul(z, z.T) / self.temperature  # [2B, 2B]
+        mask = torch.eye(2 * B, device=embeds.device, dtype=torch.bool)
+        sim.masked_fill_(mask, -1e9)
+
+        # Construct targets
+        targets = torch.arange(B, 2 * B, device=embeds.device)
+        targets = torch.cat([targets, torch.arange(0, B, device=embeds.device)], dim=0)
+
+        return self.loss_func(sim, targets)
+
 
         return self.loss_func(sim, targets)
 
@@ -268,12 +283,7 @@ class TrajectoryModel(nn.Module):
 
         self.mask_token = nn.Parameter(torch.zeros(1, config['embed_dim']))
         self.mtm = MTMHead(config['embed_dim'], config['num_nodes'])
-<<<<<<< Updated upstream
-        
-        self._x, self._edge_index = graph_data
-=======
         self.contrastive_head = ContrastiveHead(config['embed_dim'])
->>>>>>> Stashed changes
 
         self._x, self._edge_index = graph_data
 
@@ -287,6 +297,7 @@ class TrajectoryModel(nn.Module):
         node_embeddings = torch.cat([node_embeddings, self.mask_token.to(device)], dim=0)
 
         # === View 1 ===
+        # === View 1 ===
         road_embeddings = node_embeddings[batch['road_nodes']]
         spatial_features = self.cnn(spatial_grid.to(device))
         spatial_tokens = spatial_features.flatten(2).transpose(1, 2)
@@ -296,9 +307,6 @@ class TrajectoryModel(nn.Module):
         mtm_x = fused_repr[batch['mtm_mask']]
         L_mtm = self.mtm(mtm_x, origin_nodes=batch['mtm_labels'])
 
-<<<<<<< Updated upstream
-        return L_mtm
-=======
         # === View 2 (Augmented for contrastive) ===
         road_nodes_pos = batch['road_nodes'].clone()
         mtm_mask_pos = torch.zeros_like(road_nodes_pos, dtype=torch.bool)
@@ -317,5 +325,4 @@ class TrajectoryModel(nn.Module):
         L_contrastive = self.contrastive_head(concat_embed)
 
         return L_mtm, L_contrastive
->>>>>>> Stashed changes
 
