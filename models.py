@@ -191,9 +191,6 @@ class ContrastiveHead(nn.Module):
         return self.loss_func(sim, targets)
 
 
-        return self.loss_func(sim, targets)
-
-
 
 
 
