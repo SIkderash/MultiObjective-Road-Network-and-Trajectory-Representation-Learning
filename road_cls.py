@@ -1,9 +1,11 @@
 import os
+import re
 import torch
 import torch.nn as nn
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.model_selection import StratifiedKFold
 
+from GridGenerator import generate_spatial_grid
 from main import load_edge_data
 from models import TrajectoryModel
 
@@ -36,6 +38,7 @@ def evaluation(model, feature_df, fold=5):
     print("\n--- Road Classification ---")
     model.eval()
     x = model.encode_graph()  # [num_nodes, embed_dim]
+    # x = model.encode_graph_with_context(spatial_grid_tensor)
     if isinstance(x, tuple):
         x = x[0]
     x = x.detach().cpu()
@@ -99,6 +102,18 @@ if __name__ == "__main__":
                                  dtype=torch.float32)
     graph_data = (node_features, torch.tensor(edge_index, dtype=torch.long))
 
+    map_bbox = [30.730, 30.6554, 104.127, 104.0397]
+    dicts_pkl_path = os.path.join(data_path, "dicts.pkl")
+    graph_pkl_path = os.path.join('datasets/didi_chengdu/osm_graph', 'ChengDu.pkl')
+    spatial_grid_np = generate_spatial_grid(
+        edge_features_path,
+        dicts_pkl_path,
+        graph_pkl_path,
+        map_bbox=map_bbox,
+        grid_size=(64, 64)
+    )
+    spatial_grid_tensor = torch.tensor(spatial_grid_np, dtype=torch.float32).unsqueeze(0)
+
     config = {
         'node_feat_dim': node_features.shape[1],
         'gat_hidden': 64,
@@ -110,10 +125,28 @@ if __name__ == "__main__":
         'num_nodes': node_features.shape[0],
     }
 
-    model = TrajectoryModel(config, graph_data)
-    checkpoint = torch.load("checkpoints/model_epoch_10.pt")
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model = model.cuda().eval()
+
+    checkpoint_dir="checkpoints"
+    checkpoint_files = []
+    for filename in os.listdir(checkpoint_dir):
+        if re.match(r"model_epoch_\d+\.pt", filename):
+            checkpoint_files.append(os.path.join(checkpoint_dir, filename))
+
+    if not checkpoint_files:
+        print(f"No model_epoch_*.pt files found in {checkpoint_dir}")
+        exit()
+
+    checkpoint_files.sort(key=lambda f: int(re.search(r"model_epoch_(\d+)\.pt", f).group(1))) # Sort by epoch number
+
+    for checkpoint_file in checkpoint_files:
+        try:
+            print(f"Loading checkpoint: {checkpoint_file}")
+            model = TrajectoryModel(config, graph_data)
+            checkpoint = torch.load(checkpoint_file)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            model = model.cuda().eval()
+            evaluation(model, edge_features_df, fold=5)
+        except Exception as e:
+            print(f"Error loading or evaluating {checkpoint_file}: {e}")
 
 
-    evaluation(model, edge_features_df, fold=5)

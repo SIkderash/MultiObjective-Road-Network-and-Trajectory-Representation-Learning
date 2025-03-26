@@ -1,4 +1,5 @@
 import os
+import re
 import pandas as pd
 import ast
 from tqdm import tqdm
@@ -24,8 +25,10 @@ def train(model, dataloader, graph_data, spatial_grid, optimizer, config, device
     for batch_idx, batch in enumerate(pbar):
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
-        L_mtm, L_contrastive = model(batch, spatial_grid)
-        loss = config['λ1'] * L_mtm + config['λ2'] * L_contrastive
+        # L_mtm, L_contrastive = model(batch, spatial_grid)
+        # loss = config['λ1'] * L_mtm + config['λ2'] * L_contrastive
+
+        loss = model(batch, spatial_grid)
 
         optimizer.zero_grad()
         loss.backward()
@@ -35,8 +38,8 @@ def train(model, dataloader, graph_data, spatial_grid, optimizer, config, device
 
         pbar.set_postfix({
             "Batch Loss": f"{loss.item():.4f}",
-            "MTM": f"{L_mtm.item():.4f}",
-            "CL": f"{L_contrastive.item():.4f}",
+            # "MTM": f"{L_mtm.item():.4f}",
+            # "CL": f"{L_contrastive.item():.4f}",
             "Avg Loss": f"{total_loss / (batch_idx + 1):.4f}"
         })
 
@@ -58,21 +61,30 @@ def validate(model, dataloader, graph_data, spatial_grid, config, device):
 
     for batch in dataloader:
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-        L_mtm, L_contrastive = model(batch, spatial_grid)
+        # L_mtm, L_contrastive = model(batch, spatial_grid)
+        # loss = config['λ1'] * L_mtm + config['λ2'] * L_contrastive
 
-        loss = config['λ1'] * L_mtm + config['λ2'] * L_contrastive
+        loss = model(batch, spatial_grid)
         total_loss += loss.item()
-        total_mtm += L_mtm.item()
-        total_cl += L_contrastive.item()
+        # total_mtm += L_mtm.item()
+        # total_cl += L_contrastive.item()
 
     return {
         'val_loss': total_loss / num_batches,
-        'val_mtm': total_mtm / num_batches,
-        'val_cl': total_cl / num_batches,
+        # 'val_mtm': total_mtm / num_batches,
+        # 'val_cl': total_cl / num_batches,
     }
 
 
-def optimized_load_trajectory_data(data_path, include_files=None):
+def load_trajectory_data_with_cache(data_path, include_files=None, cache_name="train_trajs.pt", use_one_file=False):
+    cache_path = os.path.join(data_path, cache_name)
+
+    if os.path.exists(cache_path):
+        print(f"⚡ Loading cached trajectories from {cache_path}")
+        return torch.load(cache_path)
+
+    print("📄 Parsing CSVs (this may take time, but will be cached)...")
+
     all_files = sorted([
         os.path.join(data_path, f)
         for f in os.listdir(data_path)
@@ -83,11 +95,8 @@ def optimized_load_trajectory_data(data_path, include_files=None):
         all_files = [os.path.join(data_path, f) for f in include_files]
 
     dfs = []
-
-
-    use_one_file = True
     for file_path in all_files:
-        print("Loading file: ", file_path)
+        print(f"Loading file: {file_path}")
         df = pd.read_csv(file_path, converters={
             'path': ast.literal_eval,
             'timestamp': ast.literal_eval,
@@ -116,12 +125,38 @@ def optimized_load_trajectory_data(data_path, include_files=None):
             'total_time': row['total_time']
         })
 
+    # Save for fast reuse
+    torch.save(trajectories, cache_path)
+    print(f"✅ Saved parsed trajectories to {cache_path}")
     return trajectories
 
 def load_edge_data(edge_features_path, edge_index_path):
     edge_features_df = pd.read_csv(edge_features_path)
     edge_index = np.load(edge_index_path)
     return edge_features_df, edge_index
+
+def load_latest_checkpoint(model, optimizer, checkpoint_dir="checkpoints", device="cpu"):
+    checkpoint_files = [f for f in os.listdir(checkpoint_dir) if re.match(r"model_epoch_\d+\.pt", f)]
+
+    if not checkpoint_files:
+        print(f"No checkpoint files found in {checkpoint_dir}. Starting from scratch.")
+        return 1, model, optimizer
+
+    checkpoint_files.sort(key=lambda f: int(re.search(r"model_epoch_(\d+)\.pt", f).group(1)))
+    latest_checkpoint_path = os.path.join(checkpoint_dir, checkpoint_files[-1])
+
+    try:
+        checkpoint = torch.load(latest_checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        print(f"Resuming training from epoch {start_epoch}")
+        return start_epoch, model, optimizer
+
+    except Exception as e:
+        print(f"Error loading checkpoint {latest_checkpoint_path}: {e}")
+        print("Starting training from scratch.")
+        return 1, model, optimizer
 
 if __name__ == "__main__":
     data_path = "datasets/didi_chengdu"
@@ -133,8 +168,8 @@ if __name__ == "__main__":
     all_csvs = sorted([f for f in os.listdir(data_path) if f.endswith(".csv") and f != "edge_features.csv"])
     train_csvs, val_csvs = all_csvs[:-1], all_csvs[-1:]
 
-    train_trajs = optimized_load_trajectory_data(data_path, include_files=train_csvs)
-    val_trajs = optimized_load_trajectory_data(data_path, include_files=val_csvs)
+    train_trajs = load_trajectory_data_with_cache(data_path, include_files=train_csvs, cache_name="train_trajs.pt")
+    val_trajs = load_trajectory_data_with_cache(data_path, include_files=val_csvs, cache_name="val_trajs.pt")
 
     train_dataset = TrajectoryDataset(train_trajs, edge_features_df)
     val_dataset = TrajectoryDataset(val_trajs, edge_features_df)
@@ -173,17 +208,19 @@ if __name__ == "__main__":
         'traj_layers': 2,
         'num_nodes': node_features.shape[0],
         'λ1': 1.0,
-        'λ2': 5.0
+        # 'λ2': 30.0
     }
 
     model = TrajectoryModel(config, graph_data).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-    for epoch in range(1, 5):
+    start_epoch, model, optimizer = load_latest_checkpoint(model, optimizer, device=device)
+
+    for epoch in range(start_epoch, 31):
         avg_loss = train(model, train_loader, graph_data, spatial_grid_tensor, optimizer, config, device, epoch)
         val_metrics = validate(model, val_loader, graph_data, spatial_grid_tensor, config, device)
 
-        print(f"[Epoch {epoch}] | Train Loss: {avg_loss:.4f} | Val Loss: {val_metrics['val_loss']:.4f} | MTM: {val_metrics['val_mtm']:.4f} | CL: {val_metrics['val_cl']:.4f}")
+        print(f"[Epoch {epoch}] | Train Loss: {avg_loss:.4f} | Val Loss: {val_metrics['val_loss']:.4f}")
 
         save_path = os.path.join("checkpoints", f"model_epoch_{epoch}.pt")
         os.makedirs("checkpoints", exist_ok=True)
