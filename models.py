@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATConv
 import math
+import numpy as np
 
 # === Positional Encoding ===
 class PositionalEncoding(nn.Module):
@@ -17,9 +18,19 @@ class PositionalEncoding(nn.Module):
         self.register_buffer('pe', pe)
 
     def forward(self, x):
-        x = x + self.pe[:, :x.size(1), :]
-        return x
+        return x + self.pe[:, :x.size(1), :]
 
+# === Temporal Encoding ===
+class TemporalEncoding(nn.Module):
+    def __init__(self, embed_dim):
+        super().__init__()
+        self.omega = nn.Parameter(torch.from_numpy(1 / 10 ** np.linspace(0, 9, embed_dim)).float(), requires_grad=True)
+        self.bias = nn.Parameter(torch.zeros(embed_dim), requires_grad=True)
+        self.div_term = math.sqrt(1.0 / embed_dim)
+
+    def forward(self, timestamps):  # [B, L]
+        time_encode = timestamps.unsqueeze(-1) * self.omega + self.bias  # [B, L, D]
+        return self.div_term * torch.cos(time_encode)
 
 # === GAT Model ===
 class GATModel(nn.Module):
@@ -61,7 +72,7 @@ class SpatialTransformer(nn.Module):
     def forward(self, x):
         return self.transformer(x)
 
-# === Cross-Attention Block ===    
+# === Cross-Attention Block ===
 class CrossAttention(nn.Module):
     def __init__(self, embed_dim, num_heads):
         super().__init__()
@@ -69,21 +80,9 @@ class CrossAttention(nn.Module):
 
     def forward(self, query, key, value):
         attn_output, _ = self.attn(query, key, value)
-        return attn_output  # [B, L, D]
+        return attn_output
 
-
-# === Trajectory Encoder ===
-class TrajectoryEncoder(nn.Module):
-    def __init__(self, embed_dim, num_heads, num_layers):
-        super().__init__()
-        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads, batch_first=True)
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.pos_encoding = PositionalEncoding(embed_dim)
-
-    def forward(self, x):
-        return self.transformer(self.pos_encoding(x))
-    
-# ==== MTM Head ====
+# === MTM Head ===
 class MTMHead(nn.Module):
     def __init__(self, embed_dim, num_nodes):
         super().__init__()
@@ -106,6 +105,10 @@ class TrajectoryModel(nn.Module):
         self.spatial_transformer = SpatialTransformer(config['embed_dim'], config['num_heads'], config['spatial_layers'])
 
         self.pos_encoder = PositionalEncoding(config['embed_dim'])
+        self.temporal_encoding = TemporalEncoding(config['embed_dim'])
+        self.hour_embed = nn.Embedding(24, config['embed_dim'])
+        self.weekday_embed = nn.Embedding(7, config['embed_dim'])
+
         encoder_layer = nn.TransformerEncoderLayer(config['embed_dim'], config['num_heads'], batch_first=True)
         self.traj_encoder = nn.TransformerEncoder(encoder_layer, num_layers=config['traj_layers'])
 
@@ -117,9 +120,6 @@ class TrajectoryModel(nn.Module):
         self._x, self._edge_index = graph_data
 
     def encode_graph(self, spatial_grid=None):
-        """
-        Returns: [num_nodes, embed_dim]
-        """
         self.eval()
         with torch.no_grad():
             x = self._x.to(next(self.parameters()).device)
@@ -127,61 +127,64 @@ class TrajectoryModel(nn.Module):
             node_embeddings = self.gat(x, edge_index)
 
             if spatial_grid is not None:
-                spatial_features = self.cnn(spatial_grid)  # [1, D, H, W]
-                spatial_tokens = spatial_features.flatten(2).transpose(1, 2)  # [1, S, D]
-                spatial_repr = self.spatial_transformer(spatial_tokens)  # [1, S, D]
-                context_vector = spatial_repr.mean(dim=1)  # [1, D]
-                node_embeddings = node_embeddings + context_vector  # broadcast
+                spatial_features = self.cnn(spatial_grid)
+                spatial_tokens = spatial_features.flatten(2).transpose(1, 2)
+                spatial_repr = self.spatial_transformer(spatial_tokens)
+                context_vector = spatial_repr.mean(dim=1)
+                node_embeddings = node_embeddings + context_vector
 
             return node_embeddings
 
-    def encode_sequence(self, road_nodes_tensor, spatial_grid=None):
-        """
-        road_nodes_tensor: [B, L] — each row is a trajectory of node IDs
-        Returns: [B, D] — trajectory-level embeddings
-        """
+    def encode_sequence(self, road_nodes_tensor, timestamps, hour, weekday, spatial_grid=None):
         self.eval()
         with torch.no_grad():
             device = next(self.parameters()).device
-            node_embeddings = self.encode_graph(spatial_grid)  # already fused if needed
-
-            # Add [MASK] token to end
+            node_embeddings = self.encode_graph(spatial_grid)
             node_embeddings = torch.cat([node_embeddings, self.mask_token.to(device)], dim=0)
-            road_embed = node_embeddings[road_nodes_tensor.to(device)]  # [B, L, D]
+            road_embed = node_embeddings[road_nodes_tensor.to(device)]
 
-            # Positional encoding
+            # Temporal features
+            time_repr = self.temporal_encoding(timestamps.to(device))
+            hour_repr = self.hour_embed(hour.to(device))
+            weekday_repr = self.weekday_embed(weekday.to(device))
+
+            road_embed = road_embed + time_repr + hour_repr + weekday_repr
             road_embed = self.pos_encoder(road_embed)
 
-            # Cross-attn with spatial grid if provided
             if spatial_grid is not None:
-                spatial_features = self.cnn(spatial_grid)  # [1, D, H, W]
-                spatial_tokens = spatial_features.flatten(2).transpose(1, 2)  # [1, S, D]
-                spatial_repr = self.spatial_transformer(spatial_tokens)  # [1, S, D]
+                spatial_features = self.cnn(spatial_grid)
+                spatial_tokens = spatial_features.flatten(2).transpose(1, 2)
+                spatial_repr = self.spatial_transformer(spatial_tokens)
                 road_embed = self.cross_attn(road_embed, spatial_repr.expand(road_embed.size(0), -1, -1), spatial_repr.expand(road_embed.size(0), -1, -1))
 
-            # Transformer encoding
-            traj_encoded = self.traj_encoder(road_embed)  # [B, L, D]
-            traj_embed = traj_encoded.mean(dim=1)  # mean-pool over tokens
+            traj_encoded = self.traj_encoder(road_embed)
+            traj_embed = traj_encoded.mean(dim=1)
+            return traj_embed
 
-            return traj_embed  # [B, D]
-        
     def forward(self, batch, spatial_grid):
         device = next(self.parameters()).device
         B, L = batch['road_nodes'].shape
 
         node_embeddings = self.gat(self._x.to(device), self._edge_index.to(device))
         node_embeddings = torch.cat([node_embeddings, self.mask_token.to(device)], dim=0)
+        road_embeddings = node_embeddings[batch['road_nodes'].to(device)]
 
-        road_embeddings = node_embeddings[batch['road_nodes'].to(device)]  # [B, L, D]
-        spatial_features = self.cnn(spatial_grid.to(device))  # [1, D, H, W]
-        spatial_tokens = spatial_features.flatten(2).transpose(1, 2)  # [1, S, D]
-        spatial_repr = self.spatial_transformer(spatial_tokens).expand(B, -1, -1)  # [B, S, D]
+        # Temporal features
+        time_repr = self.temporal_encoding(batch['timestamps'].to(device))
+        hour_repr = self.hour_embed(batch['hour'].to(device))
+        weekday_repr = self.weekday_embed(batch['weekday'].to(device))
 
-        fused = self.cross_attn(road_embeddings, spatial_repr, spatial_repr)  # [B, L, D]
-        fused = self.traj_encoder(fused)  # [B, L, D]
+
+        road_embeddings = road_embeddings + time_repr + hour_repr + weekday_repr
+        road_embeddings = self.pos_encoder(road_embeddings)
+
+        spatial_features = self.cnn(spatial_grid.to(device))
+        spatial_tokens = spatial_features.flatten(2).transpose(1, 2)
+        spatial_repr = self.spatial_transformer(spatial_tokens).expand(B, -1, -1)
+
+        fused = self.cross_attn(road_embeddings, spatial_repr, spatial_repr)
+        fused = self.traj_encoder(fused)
 
         mtm_x = fused[batch['mtm_mask']]
         loss = self.mtm(mtm_x, origin_nodes=batch['mtm_labels'])
         return loss
-
-
