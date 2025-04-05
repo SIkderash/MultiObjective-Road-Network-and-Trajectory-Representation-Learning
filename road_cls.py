@@ -88,6 +88,37 @@ def evaluation(model, feature_df, fold=5):
     print(f'Macro F1: {f1_score(y_trues, y_preds, average="macro"):.4f}')
 
 
+def parse_config_from_filename(filename):
+    config = {
+        'use_temporal_encoding': False,
+        'use_time_embeddings': False,
+        'use_spatial_fusion': False,
+        'use_traj_traj_cl': False,
+        'use_traj_node_cl': False,
+        'use_node_node_cl': False,
+        'contrastive_type': 'infonce',  # default
+    }
+
+    filename = filename.lower()
+
+    if "temporal" in filename:
+        config['use_temporal_encoding'] = True
+    if "timeemb" in filename:
+        config['use_time_embeddings'] = True
+    if "spatialfusion" in filename:
+        config['use_spatial_fusion'] = True
+    if "trajtraj" in filename:
+        config['use_traj_traj_cl'] = True
+    if "trajnode" in filename:
+        config['use_traj_node_cl'] = True
+    if "nodenode" in filename:
+        config['use_node_node_cl'] = True
+    if "jsd" in filename:
+        config['contrastive_type'] = "jsd"
+
+    return config
+
+
 # === Main Entry ===
 if __name__ == "__main__":
     print("\n=== Road Classification Evaluation ===")
@@ -126,27 +157,53 @@ if __name__ == "__main__":
     }
 
 
-    checkpoint_dir="checkpoints"
+    checkpoint_dir="Models/MTM"
     checkpoint_files = []
-    for filename in os.listdir(checkpoint_dir):
-        if re.match(r"model_epoch_\d+\.pt", filename):
-            checkpoint_files.append(os.path.join(checkpoint_dir, filename))
+
+    ablation_tag = ""  # can be 'full', 'baseline', etc.
+
+    checkpoint_files = [
+        os.path.join(checkpoint_dir, f) for f in os.listdir(checkpoint_dir)
+        if f.endswith(".pt") and ablation_tag in f
+    ]
+
+    # Sort by epoch number if available in filename
+    def extract_epoch(filename):
+        match = re.search(r"epoch[_\-]?(\d+)", filename)
+        return int(match.group(1)) if match else float('inf')
+
+    checkpoint_files.sort(key=lambda f: extract_epoch(f))
 
     if not checkpoint_files:
         print(f"No model_epoch_*.pt files found in {checkpoint_dir}")
         exit()
 
-    checkpoint_files.sort(key=lambda f: int(re.search(r"model_epoch_(\d+)\.pt", f).group(1))) # Sort by epoch number
-
     for checkpoint_file in checkpoint_files:
         try:
             print(f"Loading checkpoint: {checkpoint_file}")
-            model = TrajectoryModel(config, graph_data)
+
+            # === Base Config ===
+            config = {
+                'node_feat_dim': node_features.shape[1],
+                'gat_hidden': 64,
+                'embed_dim': 128,
+                'spatial_in_channels': 8,
+                'num_heads': 4,
+                'spatial_layers': 2,
+                'traj_layers': 2,
+                'num_nodes': node_features.shape[0],
+            }
+
+            # === Augment config from filename ===
+            config.update(parse_config_from_filename(checkpoint_file))
+
+            # === Load model and checkpoint ===
+            model = TrajectoryModel(config, graph_data).cuda()
             checkpoint = torch.load(checkpoint_file)
             model.load_state_dict(checkpoint['model_state_dict'])
-            model = model.cuda().eval()
+            model = model.eval()
+
             evaluation(model, edge_features_df, fold=5)
+
         except Exception as e:
             print(f"Error loading or evaluating {checkpoint_file}: {e}")
-
-

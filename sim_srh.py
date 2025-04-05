@@ -9,7 +9,38 @@ import faiss
 from main import load_edge_data
 from models import TrajectoryModel
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# === Setup ===
+# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cpu")
+
+def parse_config_from_filename(filename):
+    config = {
+        'use_temporal_encoding': False,
+        'use_time_embeddings': False,
+        'use_spatial_fusion': False,
+        'use_traj_traj_cl': False,
+        'use_traj_node_cl': False,
+        'use_node_node_cl': False,
+        'contrastive_type': 'infonce'
+    }
+
+    filename = filename.lower()
+    if "temporal" in filename:
+        config['use_temporal_encoding'] = True
+    if "timeemb" in filename:
+        config['use_time_embeddings'] = True
+    if "spatialfusion" in filename:
+        config['use_spatial_fusion'] = True
+    if "trajtraj" in filename:
+        config['use_traj_traj_cl'] = True
+    if "trajnode" in filename:
+        config['use_traj_node_cl'] = True
+    if "nodenode" in filename:
+        config['use_node_node_cl'] = True
+    if "jsd" in filename:
+        config['contrastive_type'] = "jsd"
+
+    return config
 
 
 def load_similarity_data(data_path, file_list, padding_id, max_len=64, num_queries=5000, detour_rate=0.1):
@@ -22,40 +53,31 @@ def load_similarity_data(data_path, file_list, padding_id, max_len=64, num_queri
     df['path_len'] = df['path'].map(len)
     df = df[(df['path_len'] >= 5) & (df['path_len'] <= max_len)]
 
-    # Database
     x_arr = []
     for _, row in df.iterrows():
         path = row['path']
-        if len(path) > max_len:
-            path = path[:max_len]
-        else:
-            path = path + [padding_id] * (max_len - len(path))
+        path = path[:max_len] + [padding_id] * max(0, max_len - len(path))
         x_arr.append(path)
 
-    # Queries with detour
-    detour = lambda rate=0.9: np.random.randint(padding_id) if np.random.rand() > rate else padding_id
     indices = np.random.permutation(len(df))[:num_queries]
     q_arr = []
     for idx in indices:
         path = df.iloc[idx]['path']
         detour_pos = np.random.choice(len(path), int(len(path) * detour_rate), replace=False)
-        altered = [detour() if i in detour_pos else e for i, e in enumerate(path)]
-        if len(altered) > max_len:
-            altered = altered[:max_len]
-        else:
-            altered += [padding_id] * (max_len - len(altered))
+        altered = [np.random.randint(padding_id) if i in detour_pos else e for i, e in enumerate(path)]
+        altered = altered[:max_len] + [padding_id] * max(0, max_len - len(altered))
         q_arr.append(altered)
 
-    x_tensor = torch.tensor(x_arr, dtype=torch.long).to(device)
-    q_tensor = torch.tensor(q_arr, dtype=torch.long).to(device)
-    return x_tensor, q_tensor, indices
-
-
-def evaluation(model, data_path, file_list, num_nodes, max_len=64):
-    print("\n--- Trajectory Similarity Search ---")
-    db_data, query_data, query_ids = load_similarity_data(
-        data_path, file_list, padding_id=num_nodes, max_len=max_len
+    return (
+        torch.tensor(x_arr, dtype=torch.long).to(device),
+        torch.tensor(q_arr, dtype=torch.long).to(device),
+        indices
     )
+
+
+def evaluation(model, data_path, file_list, padding_id, max_len=64):
+    print("\n--- Trajectory Similarity Search ---")
+    db_data, query_data, query_ids = load_similarity_data(data_path, file_list, padding_id, max_len)
 
     model.eval()
     with torch.no_grad():
@@ -84,9 +106,10 @@ def evaluation(model, data_path, file_list, num_nodes, max_len=64):
     print(f"No-Hit Queries: {no_hits}/{num_queries}")
 
 
-# === Main Entry ===
+# === Entry Point ===
 if __name__ == "__main__":
     print("\n=== Similar Trajectory Retrieval ===")
+
     data_path = "datasets/didi_chengdu"
     edge_features_path = os.path.join(data_path, "edge_features.csv")
     edge_index_path = os.path.join(data_path, "line_graph_edge_idx.npy")
@@ -95,40 +118,43 @@ if __name__ == "__main__":
     node_features = torch.tensor(edge_features_df[[
         'oneway', 'lanes', 'highway_id', 'length_id',
         'bridge', 'tunnel', 'road_speed', 'traj_speed'
-    ]].values, dtype=torch.float32).to(device)
+    ]].values, dtype=torch.float32)
 
-    graph_data = (node_features, torch.tensor(edge_index, dtype=torch.long).to(device))
-    config = {
-        'node_feat_dim': node_features.shape[1],
-        'gat_hidden': 64,
-        'embed_dim': 128,
-        'spatial_in_channels': 8,
-        'num_heads': 4,
-        'spatial_layers': 2,
-        'traj_layers': 2,
-        'num_nodes': node_features.shape[0],
-    }
+    graph_data = (node_features, torch.tensor(edge_index, dtype=torch.long))
 
-    model = TrajectoryModel(config, graph_data).to(device)
+    all_csvs = sorted([f for f in os.listdir(data_path) if f.endswith(".csv") and f != "edge_features.csv"])
+    task_files = all_csvs[-1:]
 
-    checkpoint_dir="checkpoints"
-    checkpoint_files = []
-    for filename in os.listdir(checkpoint_dir):
-        if re.match(r"model_epoch_\d+\.pt", filename):
-            checkpoint_files.append(os.path.join(checkpoint_dir, filename))
+    checkpoint_dir = "Models/MTM"
+    ablation_tag = ""  # Set tag like "trajnode", "spatialfusion", etc.
+    checkpoint_files = [
+        os.path.join(checkpoint_dir, f) for f in os.listdir(checkpoint_dir)
+        if f.endswith(".pt") and ablation_tag in f
+    ]
+    checkpoint_files.sort(key=lambda f: int(re.search(r"model_epoch_(\d+)", f).group(1)))
 
     if not checkpoint_files:
-        print(f"No model_epoch_*.pt files found in {checkpoint_dir}")
+        print(f"No matching checkpoint files found for tag '{ablation_tag}' in {checkpoint_dir}")
         exit()
-
-    checkpoint_files.sort(key=lambda f: int(re.search(r"model_epoch_(\d+)\.pt", f).group(1))) # Sort by epoch number
 
     for checkpoint_file in checkpoint_files:
         try:
-            print(f"Loading checkpoint: {checkpoint_file}")
-            model = TrajectoryModel(config, graph_data)
-            checkpoint = torch.load(checkpoint_file)
+            print(f"\nLoading checkpoint: {checkpoint_file}")
 
+            config = {
+                'node_feat_dim': node_features.shape[1],
+                'gat_hidden': 64,
+                'embed_dim': 128,
+                'spatial_in_channels': 8,
+                'num_heads': 4,
+                'spatial_layers': 2,
+                'traj_layers': 2,
+                'num_nodes': node_features.shape[0],
+            }
+            config.update(parse_config_from_filename(checkpoint_file))
+
+            model = TrajectoryModel(config, graph_data).to(device)
+            checkpoint = torch.load(checkpoint_file, map_location=device)
             state_dict = checkpoint['model_state_dict']
             new_state_dict = {}
             for key, val in state_dict.items():
@@ -140,11 +166,10 @@ if __name__ == "__main__":
                     new_state_dict['gat.gat2.lin_dst.weight'] = val
                 else:
                     new_state_dict[key] = val
-
             model.load_state_dict(new_state_dict)
-            model = model.eval()
-            all_csvs = sorted([f for f in os.listdir(data_path) if f.endswith(".csv") and f != "edge_features.csv"])
-            task_files = all_csvs[-1:]  # last file for eval
-            evaluation(model, data_path, task_files, config['num_nodes'], max_len=64)
+            model.eval()
+
+            evaluation(model, data_path, task_files, padding_id=config['num_nodes'])
+
         except Exception as e:
             print(f"Error loading or evaluating {checkpoint_file}: {e}")
