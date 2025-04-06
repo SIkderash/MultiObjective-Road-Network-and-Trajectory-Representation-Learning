@@ -120,7 +120,7 @@ if __name__ == "__main__":
 
     graph_data = (node_features, torch.tensor(edge_index, dtype=torch.long))
 
-    checkpoint_dir = "Models/MTM"
+    checkpoint_dir = "checkpoints"
     ablation_tag = ""  # change as needed
     checkpoint_files = [
         os.path.join(checkpoint_dir, f) for f in os.listdir(checkpoint_dir)

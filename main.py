@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 
 from TrajectoryDataset import TrajectoryDataset
 from models import TrajectoryModel
-from GridGenerator import generate_spatial_grid
+from GridGenerator import generate_spatial_grid, load_node_id_to_coord
 from logger import setup_logger, generate_ablation_name
 
 
@@ -34,15 +34,26 @@ def train(model, dataloader, graph_data, spatial_grid, optimizer, config, device
 
     x, edge_index = graph_data
     x, edge_index = x.to(device), edge_index.to(device)
+
+    # Expand grid once if needed
     spatial_grid = spatial_grid.to(device)
+    if spatial_grid.size(0) == 1:
+        batch_size = dataloader.batch_size or 64  # fallback
+        spatial_grid = spatial_grid.expand(batch_size, -1, -1, -1)
 
     pbar = tqdm(dataloader, desc=f"[Epoch {epoch}] Training", leave=True)
     for batch_idx, batch in enumerate(pbar):
+        batch_size = batch['road_nodes'].size(0)
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
-        L_mtm, L_t2t, L_t2n, L_n2n = model(batch, spatial_grid)
+        # Select only B samples of the grid if needed
+        current_grid = spatial_grid[:batch_size]  # [B, C, H, W]
+
+        L_mtm, L_t2t, L_t2n, L_n2n = model(batch, current_grid)
+
         loss = config['λ1'] * L_mtm
         total_losses[0] += L_mtm.item()
+
         if config['use_traj_traj_cl']:
             loss += config['λ2'] * L_t2t
             total_losses[1] += L_t2t.item()
@@ -78,19 +89,32 @@ def validate(model, dataloader, graph_data, spatial_grid, config, device, epoch,
 
     x, edge_index = graph_data
     x, edge_index = x.to(device), edge_index.to(device)
+
+    # Expand grid once if needed
     spatial_grid = spatial_grid.to(device)
+    if spatial_grid.size(0) == 1:
+        batch_size = dataloader.batch_size or 64
+        spatial_grid = spatial_grid.expand(batch_size, -1, -1, -1)
 
     for batch in dataloader:
+        batch_size = batch['road_nodes'].size(0)
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-        L_mtm, L_t2t, L_t2n, L_n2n = model(batch, spatial_grid)
-        total_losses[0] += L_mtm.item()
-        total_losses[1] += L_t2t.item()
-        total_losses[2] += L_t2n.item()
-        total_losses[3] += L_n2n.item()
+        current_grid = spatial_grid[:batch_size]
+
+        L_mtm, L_t2t, L_t2n, L_n2n = model(batch, current_grid)
+
+        total_losses[0] += config['λ1'] * L_mtm.item()
+        total_losses[1] += config['λ2'] * L_t2t.item() if config['use_traj_traj_cl'] else 0.0
+        total_losses[2] += config['λ3'] * L_t2n.item() if config['use_traj_node_cl'] else 0.0
+        total_losses[3] += config['λ4'] * L_n2n.item() if config['use_node_node_cl'] else 0.0
 
     avg_losses = [l / num_batches for l in total_losses]
+    total_val_loss = sum(avg_losses)
+
     logger.info(f"[Val Epoch {epoch}] MTM={avg_losses[0]:.4f}, T2T={avg_losses[1]:.4f}, T2N={avg_losses[2]:.4f}, N2N={avg_losses[3]:.4f}")
-    return sum(avg_losses)
+    return total_val_loss
+
+
 
 def load_trajectory_data_with_cache(data_path, include_files=None, cache_name="train_trajs.pt", use_one_file=False):
     cache_path = os.path.join(data_path, cache_name)
@@ -200,6 +224,8 @@ if __name__ == "__main__":
     map_bbox = [30.730, 30.6554, 104.127, 104.0397]
     graph_pkl_path = os.path.join(data_path, "osm_graph", "ChengDu.pkl")
     spatial_grid_np = generate_spatial_grid(edge_features_path, dicts_pkl_path, graph_pkl_path, map_bbox=map_bbox, grid_size=(64, 64))
+    node_id_to_coord = load_node_id_to_coord(dicts_pkl_path, graph_pkl_path, map_bbox=map_bbox, grid_size=(64, 64))
+
     spatial_grid_tensor = torch.tensor(spatial_grid_np, dtype=torch.float32).unsqueeze(0)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -228,7 +254,7 @@ if __name__ == "__main__":
     ablation_name = generate_ablation_name(config)
     logger = setup_logger("logs", config)
 
-    model = TrajectoryModel(config, graph_data).to(device)
+    model = TrajectoryModel(config, graph_data, node_id_to_coord).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     start_epoch, model, optimizer = load_latest_checkpoint(model, optimizer, device=device)
 

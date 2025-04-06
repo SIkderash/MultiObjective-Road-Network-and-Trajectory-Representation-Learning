@@ -160,11 +160,11 @@ def evaluation(model, data_path, file_list, actual_spatial_grid_tensor, padding_
         raise
 
     reg = MLPRegressor(input_dim=X_train_embed.shape[1]).to(device)
-    opt = torch.optim.Adam(reg.parameters(), lr=1e-3)
+    opt = torch.optim.Adam(reg.parameters(), lr=1e-2)
     criterion = nn.MSELoss()
 
     best_mae, best_rmse = float('inf'), float('inf')
-    for epoch in range(1, 51):
+    for epoch in range(1, 1001):
         reg.train()
         opt.zero_grad()
         pred = reg(X_train_embed)
@@ -213,7 +213,7 @@ if __name__ == "__main__":
     )
     spatial_grid_tensor = torch.tensor(spatial_grid_np, dtype=torch.float32).unsqueeze(0)
     
-    checkpoint_dir = "Models\MTM"
+    checkpoint_dir = "checkpoints"
     ablation_tag = ""  # ← update tag for filtering if needed
     checkpoint_files = [
         os.path.join(checkpoint_dir, f) for f in os.listdir(checkpoint_dir)

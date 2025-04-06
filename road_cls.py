@@ -42,7 +42,7 @@ def evaluation(model, feature_df, fold=5):
     if isinstance(x, tuple):
         x = x[0]
     x = x.detach().cpu()
-
+    # print(feature_df.columns)
     valid_labels = ['primary', 'secondary', 'tertiary', 'residential']
     id_dict = {lbl: i for i, lbl in enumerate(valid_labels)}
     y_df = feature_df[feature_df['highway'].isin(valid_labels)].copy()
@@ -61,11 +61,11 @@ def evaluation(model, feature_df, fold=5):
         x_test, y_test = x[test_idx], y[test_idx]
 
         clf = Classifier(x.shape[1], len(valid_labels)).cuda()
-        opt = torch.optim.Adam(clf.parameters(), lr=1e-3)
+        opt = torch.optim.Adam(clf.parameters(), lr=1e-2)
 
         best_pred = None
         best_acc = 0
-        for epoch in range(1, 101):
+        for epoch in range(1, 501):
             clf.train()
             opt.zero_grad()
             loss = nn.CrossEntropyLoss()(clf(x_train.cuda()), y_train.cuda())
@@ -157,7 +157,7 @@ if __name__ == "__main__":
     }
 
 
-    checkpoint_dir="Models/MTM"
+    checkpoint_dir="checkpoints"
     checkpoint_files = []
 
     ablation_tag = ""  # can be 'full', 'baseline', etc.

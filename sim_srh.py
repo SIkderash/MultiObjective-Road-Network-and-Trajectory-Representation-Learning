@@ -125,7 +125,7 @@ if __name__ == "__main__":
     all_csvs = sorted([f for f in os.listdir(data_path) if f.endswith(".csv") and f != "edge_features.csv"])
     task_files = all_csvs[-1:]
 
-    checkpoint_dir = "Models/MTM"
+    checkpoint_dir = "checkpoints"
     ablation_tag = ""  # Set tag like "trajnode", "spatialfusion", etc.
     checkpoint_files = [
         os.path.join(checkpoint_dir, f) for f in os.listdir(checkpoint_dir)
