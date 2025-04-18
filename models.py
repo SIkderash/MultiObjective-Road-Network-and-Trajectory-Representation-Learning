@@ -76,18 +76,6 @@ class SpatialTransformer(nn.Module):
     def forward(self, x):
         return self.encoder(x)
 
-
-# === Cross Attention ===
-# class CrossAttention(nn.Module):
-#     def __init__(self, embed_dim, num_heads):
-#         super().__init__()
-#         self.attn = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=num_heads, batch_first=True)
-
-#     def forward(self, query, key, value):
-#         out, _ = self.attn(query, key, value)
-#         return out
-
-# === Contrastive Loss ===
 def contrastive_loss(z1, z2, loss_type="infonce", temperature=0.1):
     z1 = F.normalize(z1, dim=1)
     z2 = F.normalize(z2, dim=1)
@@ -150,10 +138,18 @@ class TrajectoryModel(nn.Module):
     def __init__(self, config, graph_data, node_id_to_coord=None):
         super().__init__()
         self.config = config
-        self._x, self._edge_index = graph_data
-        self.node_id_to_coord = node_id_to_coord
+        if config.get("use_node_embedding", False):
+            self.use_node_embedding = True
+            self.node_embedding = nn.Embedding(config['num_nodes'], config['embed_dim'])
+            nn.init.xavier_uniform_(self.node_embedding.weight)
+        else:
+            self.use_node_embedding = False
+            self._x = graph_data[0]
 
-        self.gat = GATModel(config['node_feat_dim'], config['gat_hidden'], config['embed_dim'])
+        self._edge_index = graph_data[1]
+        self.node_id_to_coord = node_id_to_coord
+        in_channels = config['embed_dim'] if config['use_node_embedding'] else config['node_feat_dim']
+        self.gat = GATModel(in_channels, config['gat_hidden'], config['embed_dim'])
         self.cnn = CNNModel(config['spatial_in_channels'], config['embed_dim'])
         self.spatial_transformer = SpatialTransformer(config['embed_dim'], config['num_heads'], config['spatial_layers'])
 
@@ -183,28 +179,39 @@ class TrajectoryModel(nn.Module):
         transformer_layer = nn.TransformerEncoderLayer(config['embed_dim'], config['num_heads'], batch_first=True)
         self.traj_encoder = nn.TransformerEncoder(transformer_layer, num_layers=config['traj_layers'])
 
+    
     def encode_graph(self, spatial_grid=None):
-        x = self._x.to(next(self.parameters()).device)
-        edge_index = self._edge_index.to(next(self.parameters()).device)
+        device = next(self.parameters()).device
+
+        if self.use_node_embedding:
+            x = self.node_embedding.weight
+        else:
+            x = self._x.to(device)
+
+        edge_index = self._edge_index.to(device)
         node_embed = self.gat(x, edge_index)
 
+        spatial_repr = None
+        spatial_shape = None
+
         if self.config['use_spatial_fusion'] and spatial_grid is not None:
-            spatial_features = self.cnn(spatial_grid)
-            spatial_tokens = spatial_features.flatten(2).transpose(1, 2)  # [B, N, D]
+            spatial_features = self.cnn(spatial_grid)  # [B, D, H, W]
+            spatial_shape = spatial_features.shape[2:]  # (H, W)
+            spatial_tokens = spatial_features.flatten(2).transpose(1, 2)  # [B, HW, D]
             spatial_repr = self.spatial_transformer(spatial_tokens)
 
-            # Residual spatial fusion
-            context = spatial_repr.mean(dim=(0, 1))  # [D] ← average over B and all spatial tokens
+            context = spatial_repr.mean(dim=(0, 1))  # Global mean pooling
             context = self.norm(self.dropout(context)).unsqueeze(0)  # [1, D]
-            node_embed = node_embed + context  # [N, D]
+            node_embed = node_embed + context  # Residual fusion
+
+        return node_embed, spatial_repr, spatial_shape
 
 
-        return node_embed
 
-    def encode_sequence(self, node_sequences, timestamps=None, hour=None, weekday=None,
-                        spatial_grid=None, return_all=False, attention_mask=None):
+    def encode_sequence(self, node_sequences, timestamps=None, hour=None, weekday=None, 
+                        spatial_repr=None, spatial_shape=None):
         device = next(self.parameters()).device
-        node_embed = self.encode_graph(spatial_grid)
+        node_embed = self.encode_graph(None)[0]  # Don't recompute, we already have it
         node_embed = torch.cat([node_embed, self.mask_token.weight], dim=0)
 
         traj_embed = node_embed[node_sequences.to(device)]
@@ -218,24 +225,13 @@ class TrajectoryModel(nn.Module):
         traj_embed = self.pos_encoder(traj_embed)
         traj_embed = self.dropout(traj_embed)
 
-        if self.config['use_spatial_fusion'] and spatial_grid is not None and self.node_id_to_coord is not None:
-            spatial_features = self.cnn(spatial_grid)
-            spatial_tokens = spatial_features.flatten(2).transpose(1, 2)  # [B, H*W, D]
-            B, HW, D = spatial_tokens.shape  # <- use this to dynamically match mask size
+        if self.config['use_spatial_fusion'] and spatial_repr is not None and self.node_id_to_coord is not None:
+            B, HW, D = spatial_repr.shape
+            H, W = spatial_shape 
+            orig_H, orig_W = 64, 64  # Used in node_id_to_coord
+            scale_y, scale_x = H / orig_H, W / orig_W
 
-            # Now build the mask of shape [B, HW]
-            mask = torch.zeros((B, HW), device=spatial_grid.device)
-
-            # Original grid size (used in node_id_to_coord)
-            orig_H, orig_W = 64, 64
-
-            # Actual CNN output size
-            H, W = spatial_features.shape[2:]
-
-            scale_y = H / orig_H
-            scale_x = W / orig_W
-
-
+            mask = torch.zeros((B, HW), device=device)
             for i in range(node_sequences.size(0)):
                 for nid in node_sequences[i]:
                     nid = int(nid.item())
@@ -243,32 +239,24 @@ class TrajectoryModel(nn.Module):
                         y, x = self.node_id_to_coord[nid]
                         y = int(y * scale_y)
                         x = int(x * scale_x)
-
                         if 0 <= y < H and 0 <= x < W:
                             idx = y * W + x
                             mask[i, idx] = 1.0
 
-            spatial_repr = self.spatial_transformer(spatial_tokens)  # [B, H*W, D]
-            mask = mask.bool()  # key_padding_mask expects bool
+            mask = mask.bool()
 
             traj_embed = traj_embed + self.cross_attn(
                 traj_embed,
                 spatial_repr,
                 spatial_repr,
-                spatial_mask=mask  # you’ll pass this into CrossAttention
+                spatial_mask=mask
             )
-            traj_embed = self.norm(self.dropout(traj_embed))  # better stability
+            traj_embed = self.norm(self.dropout(traj_embed))
 
         encoded = self.final_norm(self.traj_encoder(traj_embed))
 
-        if return_all:
-            return encoded
+        return encoded
 
-        if attention_mask is not None:
-            mask = attention_mask.unsqueeze(-1).to(device)
-            return (encoded * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-5)
-        else:
-            return encoded.mean(dim=1)
 
     def node_sequence_contrastive_loss(self, traj_embed, road_nodes_tensor, node_embeddings):
         B = traj_embed.size(0)
@@ -287,7 +275,7 @@ class TrajectoryModel(nn.Module):
         device = next(self.parameters()).device
         B, L = batch['road_nodes'].shape
 
-        node_embeddings = self.encode_graph(spatial_grid)
+        node_embeddings, spatial_repr, spatial_shape = self.encode_graph(spatial_grid)
         node_embeddings = torch.cat([node_embeddings, self.mask_token.weight.to(device)], dim=0)
 
         traj_repr = self.encode_sequence(
@@ -295,10 +283,16 @@ class TrajectoryModel(nn.Module):
             timestamps=batch.get('timestamps'),
             hour=batch.get('hour'),
             weekday=batch.get('weekday'),
-            spatial_grid=spatial_grid,
-            return_all=True
+            spatial_repr=spatial_repr,
+            spatial_shape=spatial_shape
         )
 
+        if batch.get('attention_mask') is not None:
+            pooled = (traj_repr * batch['attention_mask'].unsqueeze(-1)).sum(dim=1) / \
+                    batch['attention_mask'].sum(dim=1, keepdim=True).clamp(min=1e-5)
+        else:
+            pooled = traj_repr.mean(dim=1)
+    
         mtm_x = traj_repr[batch['mtm_mask']]
         L_mtm = self.mtm(mtm_x, origin_nodes=batch['mtm_labels'])
 
@@ -308,24 +302,32 @@ class TrajectoryModel(nn.Module):
         L_cl_node_node = torch.tensor(0.0, device=device)
 
         if self.config['use_traj_traj_cl']:
-            traj_embed = self.projector(traj_repr.mean(dim=1))
+            traj_embed = self.projector(pooled)
             road_nodes_aug = batch['road_nodes'].clone()
             for i in range(B):
                 num_mask = max(1, int(0.15 * L))
                 mask_indices = torch.randperm(L)[:num_mask]
                 road_nodes_aug[i, mask_indices] = self._x.shape[0]
 
-            traj_embed_aug = self.projector(self.encode_sequence(
-                road_nodes_aug,
+            aug_repr = self.encode_sequence(
+                node_sequences=road_nodes_aug,
                 timestamps=batch.get('timestamps'),
                 hour=batch.get('hour'),
                 weekday=batch.get('weekday'),
-                spatial_grid=spatial_grid
-            ))
+                spatial_repr=spatial_repr,
+                spatial_shape=spatial_shape
+            )
+
+            if batch.get('attention_mask') is not None:
+                aug_pooled = (aug_repr * batch['attention_mask'].unsqueeze(-1)).sum(dim=1) / \
+                            batch['attention_mask'].sum(dim=1, keepdim=True).clamp(min=1e-5)
+            else:
+                aug_pooled = aug_repr.mean(dim=1)
+
+            traj_embed_aug = self.projector(aug_pooled)
             L_cl_traj = contrastive_loss(traj_embed, traj_embed_aug, loss_type=self.config['contrastive_type'])
 
         if self.config['use_traj_node_cl']:
-            traj_embed = self.projector(traj_repr.mean(dim=1))
             L_cl_node = self.node_sequence_contrastive_loss(traj_embed, batch['road_nodes'], node_embeddings)
 
         if self.config['use_node_node_cl']:

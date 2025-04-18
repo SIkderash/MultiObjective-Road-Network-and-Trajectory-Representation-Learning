@@ -20,6 +20,7 @@ def setup_logger(log_dir, config):
 def generate_ablation_name(config):
     flags = []
     flags.append("MTM")
+    if config.get('use_node_embedding'): flags.append("node_embed")
     if config.get('use_temporal_encoding'): flags.append("temporal")
     if config.get('use_time_embeddings'): flags.append("timeemb")
     if config.get('use_spatial_fusion'): flags.append("spatialfusion")

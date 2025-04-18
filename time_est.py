@@ -12,6 +12,8 @@ from GridGenerator import generate_spatial_grid
 from main import load_edge_data
 from models import TrajectoryModel
 
+from datetime import timezone
+
 # Reproducibility
 import random
 random.seed(42)
@@ -27,6 +29,7 @@ device = torch.device("cpu")
 
 def parse_config_from_filename(filename):
     config = {
+        'use_node_embedding': False,
         'use_temporal_encoding': False,
         'use_time_embeddings': False,
         'use_spatial_fusion': False,
@@ -37,6 +40,9 @@ def parse_config_from_filename(filename):
     }
 
     filename = filename.lower()
+    if "node_embed" in filename:
+        config['use_node_embedding'] = True
+        print("Using Node Embedding")
     if "temporal" in filename:
         config['use_temporal_encoding'] = True
     if "timeemb" in filename:
@@ -53,21 +59,6 @@ def parse_config_from_filename(filename):
         config['contrastive_type'] = "jsd"
 
     return config
-
-
-class MLPRegressor(nn.Module):
-    def __init__(self, input_dim, hidden_dim=128, num_layers=3):
-        super().__init__()
-        layers = []
-        for _ in range(num_layers - 1):
-            layers.append(nn.Linear(input_dim, hidden_dim))
-            layers.append(nn.ReLU())
-        layers.append(nn.Linear(hidden_dim, 1))
-        self.mlp = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.mlp(x).squeeze(-1)
-
 
 def load_task_data(data_path, file_list, padding_id, max_len=64):
     dfs = []
@@ -97,8 +88,8 @@ def load_task_data(data_path, file_list, padding_id, max_len=64):
         path += [padding_id] * pad_len
         timestamps += [timestamps[-1]] * pad_len if timestamps else [0] * pad_len
 
-        hours = [datetime.utcfromtimestamp(ts).hour for ts in timestamps]
-        weekdays = [datetime.utcfromtimestamp(ts).weekday() for ts in timestamps]
+        hours = [datetime.fromtimestamp(ts, tz=timezone.utc).hour for ts in timestamps]
+        weekdays = [datetime.fromtimestamp(ts, tz=timezone.utc).weekday() for ts in timestamps]
 
         X_dict.append({
             'road_nodes': path,
@@ -120,14 +111,45 @@ def load_task_data(data_path, file_list, padding_id, max_len=64):
 
 def batched_encode(model, X_dict, batch_size=256, spatial_grid=None):
     all_embeds = []
+    model.eval()
+
     for i in range(0, len(X_dict['road_nodes']), batch_size):
         batch = {k: v[i:i+batch_size].to(device) for k, v in X_dict.items()}
+
         embeds = model.encode_sequence(
-            batch['road_nodes'], batch['timestamps'], batch['hour'], batch['weekday'],
-            spatial_grid=spatial_grid
+            node_sequences=batch['road_nodes'],
+            timestamps=batch.get('timestamps'),
+            hour=batch.get('hour'),
+            weekday=batch.get('weekday'),
+            spatial_repr=spatial_grid,
+            spatial_shape=spatial_grid.shape[-2:] if spatial_grid is not None else None
         )
-        all_embeds.append(embeds.cpu())
+
+        # embeds shape: [B, L, D]
+        if 'attention_mask' in batch:
+            pooled = (embeds * batch['attention_mask'].unsqueeze(-1)).sum(dim=1) / \
+                     batch['attention_mask'].sum(dim=1, keepdim=True).clamp(min=1e-5)
+        else:
+            pooled = embeds.mean(dim=1)
+
+        all_embeds.append(pooled.cpu())
+
     return torch.cat(all_embeds, dim=0)
+
+
+class MLPRegressor(nn.Module):
+    def __init__(self, input_dim, hidden_dim=128, num_layers=3):
+        super().__init__()
+        layers = []
+        for _ in range(num_layers - 1):
+            layers.append(nn.Linear(input_dim, hidden_dim))
+            layers.append(nn.ReLU())
+        layers.append(nn.Linear(hidden_dim, 1))
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.mlp(x).squeeze(-1)
+
 
 def evaluation(model, data_path, file_list, actual_spatial_grid_tensor, padding_id, max_len=64):
     print("\n=== Travel Time Estimation ===")
@@ -135,54 +157,64 @@ def evaluation(model, data_path, file_list, actual_spatial_grid_tensor, padding_
 
     X_dict, Y = load_task_data(data_path, file_list, padding_id, max_len)
 
-    # Convert to device
-    X_dict = {k: v.to(device) for k, v in X_dict.items()}
-    Y = Y.to(device)
-
-    # Shuffle
+    # Shuffle and split
     indices = torch.randperm(Y.size(0))
     X_dict = {k: v[indices] for k, v in X_dict.items()}
     Y = Y[indices]
-
-    # Split
     split = int(0.2 * Y.size(0))
     X_train = {k: v[split:] for k, v in X_dict.items()}
     X_val   = {k: v[:split] for k, v in X_dict.items()}
     Y_train, Y_val = Y[split:], Y[:split]
 
-    try:
-        with torch.no_grad():
-                spatial_grid = actual_spatial_grid_tensor.to(device) if config['use_spatial_fusion'] else None
-                X_train_embed = batched_encode(model, X_train, spatial_grid=spatial_grid)
-                X_val_embed = batched_encode(model, X_val, spatial_grid=spatial_grid)
-    except Exception as e:
-        print("Caught during encode_sequence:", e)
-        raise
+    with torch.no_grad():
+        spatial_grid = actual_spatial_grid_tensor.to(device) if model.config['use_spatial_fusion'] else None
+        X_train_embed = batched_encode(model, X_train, spatial_grid=spatial_grid)
+        X_val_embed = batched_encode(model, X_val, spatial_grid=spatial_grid)
 
+    # Regressor setup
     reg = MLPRegressor(input_dim=X_train_embed.shape[1]).to(device)
-    opt = torch.optim.Adam(reg.parameters(), lr=1e-2)
+    opt = torch.optim.Adam(reg.parameters(), lr=1e-2, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        opt, mode='min', factor=0.7, patience=10, threshold=1e-3, min_lr=1e-5
+    )
     criterion = nn.MSELoss()
 
-    best_mae, best_rmse = float('inf'), float('inf')
-    for epoch in range(1, 1001):
+    best_mae, best_rmse, best_epoch = float('inf'), float('inf'), 0
+    patience_counter = 0
+    early_stop_patience = 200
+
+    for epoch in range(1, 10001):
         reg.train()
         opt.zero_grad()
-        pred = reg(X_train_embed)
-        loss = criterion(pred, Y_train)
+        pred = reg(X_train_embed.to(device))
+        loss = criterion(pred, Y_train.to(device))
         loss.backward()
         opt.step()
 
         reg.eval()
         with torch.no_grad():
-            pred_val = reg(X_val_embed)
+            pred_val = reg(X_val_embed.to(device))
             mae = mean_absolute_error(Y_val.cpu(), pred_val.cpu())
             rmse = mean_squared_error(Y_val.cpu(), pred_val.cpu()) ** 0.5
+            scheduler.step(mae)
 
-        print(f"[Epoch {epoch}] MAE: {mae:.4f} | RMSE: {rmse:.4f}")
-        best_mae = min(best_mae, mae)
-        best_rmse = min(best_rmse, rmse)
+        if mae < best_mae:
+            best_mae = mae
+            best_rmse = rmse
+            best_epoch = epoch
+            patience_counter = 0
+        else:
+            patience_counter += 1
 
-    print(f"\n>>> Best MAE: {best_mae:.4f}, Best RMSE: {best_rmse:.4f}")
+        if epoch % 25 == 0 or patience_counter == 0:
+            print(f"[Epoch {epoch}] MAE: {mae:.4f} | RMSE: {rmse:.4f} | LR: {opt.param_groups[0]['lr']:.5f}")
+
+        if patience_counter >= early_stop_patience:
+            print(f"⏹️ Early stopping at epoch {epoch}. Best MAE: {best_mae:.4f}")
+            break
+
+    print(f"\n>>> Best MAE: {best_mae:.4f}, Best RMSE: {best_rmse:.4f} (Epoch {best_epoch})")
+
 
 
 # === Entry ===

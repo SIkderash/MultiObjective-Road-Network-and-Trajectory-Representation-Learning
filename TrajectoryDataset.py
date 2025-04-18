@@ -56,6 +56,7 @@ class TrajectoryDataset(Dataset):
         weekdays = torch.stack([b['weekday'] for b in batch], dim=0)
 
         mtm_mask = torch.zeros_like(road_nodes, dtype=torch.bool)
+        attention_mask = (road_nodes != 0)  # 1 for real tokens, 0 for padding
         for i in range(B):
             num_mask = max(1, int(0.15 * L))
             mask_indices = random.sample(range(L), num_mask)
@@ -73,5 +74,6 @@ class TrajectoryDataset(Dataset):
             'mtm_labels': mtm_labels,
             'timestamps': timestamps,
             'hour': hours,
-            'weekday': weekdays
+            'weekday': weekdays,
+            'attention_mask': attention_mask
         }

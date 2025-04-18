@@ -1,3 +1,4 @@
+# main.py
 import os
 import re
 import argparse
@@ -16,6 +17,7 @@ from logger import setup_logger, generate_ablation_name
 
 def parse_args():
     parser = argparse.ArgumentParser()
+    parser.add_argument('--use_node_embedding', action='store_true')
     parser.add_argument('--use_temporal_encoding', action='store_true')
     parser.add_argument('--use_time_embeddings', action='store_true')
     parser.add_argument('--use_spatial_fusion', action='store_true')
@@ -176,13 +178,15 @@ def load_edge_data(edge_features_path, edge_index_path):
     return edge_features_df, edge_index
 
 def load_latest_checkpoint(model, optimizer, checkpoint_dir="checkpoints", device="cpu"):
-    checkpoint_files = [f for f in os.listdir(checkpoint_dir) if re.match(r"model_epoch_\d+\.pt", f)]
-
+    checkpoint_files = [
+        f for f in os.listdir(checkpoint_dir)
+        if re.match(r"model_epoch_(\d+)_.*\.pt", f)
+    ]
     if not checkpoint_files:
         print(f"No checkpoint files found in {checkpoint_dir}. Starting from scratch.")
         return 1, model, optimizer
 
-    checkpoint_files.sort(key=lambda f: int(re.search(r"model_epoch_(\d+)\.pt", f).group(1)))
+    checkpoint_files.sort(key=lambda f: int(re.search(r"model_epoch_(\d+)", f).group(1)))
     latest_checkpoint_path = os.path.join(checkpoint_dir, checkpoint_files[-1])
 
     try:
@@ -190,12 +194,12 @@ def load_latest_checkpoint(model, optimizer, checkpoint_dir="checkpoints", devic
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
-        print(f"Resuming training from epoch {start_epoch}")
+        print(f"🔁 Resuming training from epoch {start_epoch} using checkpoint {latest_checkpoint_path}")
         return start_epoch, model, optimizer
 
     except Exception as e:
-        print(f"Error loading checkpoint {latest_checkpoint_path}: {e}")
-        print("Starting training from scratch.")
+        print(f"⚠️ Error loading checkpoint {latest_checkpoint_path}: {e}")
+        print("🚨 Starting training from scratch.")
         return 1, model, optimizer
 
 # === Replace your __main__ block with this: ===
@@ -219,7 +223,8 @@ if __name__ == "__main__":
     train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, collate_fn=train_dataset.collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False, collate_fn=val_dataset.collate_fn)
 
-    node_features = torch.tensor(edge_features_df[[ 'oneway', 'lanes', 'highway_id', 'length_id', 'bridge', 'tunnel', 'road_speed', 'traj_speed' ]].values, dtype=torch.float32)
+    node_features = torch.tensor(edge_features_df[[ 'oneway', 'lanes', 'length', 'bridge', 'tunnel']].values, dtype=torch.float32)
+    
 
     map_bbox = [30.730, 30.6554, 104.127, 104.0397]
     graph_pkl_path = os.path.join(data_path, "osm_graph", "ChengDu.pkl")
@@ -249,9 +254,11 @@ if __name__ == "__main__":
         'use_traj_node_cl': args.use_traj_node_cl,
         'use_node_node_cl': args.use_node_node_cl,
         'contrastive_type': args.contrastive_type,
+        'use_node_embedding': args.use_node_embedding,
     }
 
     ablation_name = generate_ablation_name(config)
+    print("Model name", ablation_name)
     logger = setup_logger("logs", config)
 
     model = TrajectoryModel(config, graph_data, node_id_to_coord).to(device)
